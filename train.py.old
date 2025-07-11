@@ -1,0 +1,204 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim.lr_scheduler as lr_scheduler
+from torchvision.transforms import v2
+from torch.utils.data import Dataset, DataLoader
+from typing import Optional, Tuple
+import yaml
+import os
+import cv2
+import tqdm
+import matplotlib.pyplot as plt
+import transformer_engine.pytorch as te
+import argparse
+
+class ClassificationDataset(Dataset):
+    def __init__(self, path: str, subset: str, n_classes: int, transforms: Optional[v2.Transform] = None):
+        n_classes = n_classes
+        self.path = path
+        self.n_classes = n_classes
+        self.filenames = os.listdir(self.path)
+        self.transforms = transforms
+    
+    def __len__(self):
+        return len(self.filenames)
+    
+    def __getitem__(self, index):
+        loc = os.path.join(self.path, self.filenames[index])
+        img = cv2.imread(loc)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        label = self.filenames[index].split('_')[-1].split('.')[0]
+        label = int(label)
+
+        if self.transforms:
+            img = self.transforms(img)
+
+        return img, label
+    
+def plot(train_accs: list, val_accs: list, learning_rates: list, epoch: int, save_directory: str):
+    plt.style.use('dark_background')
+    epochs_range = range(1, epoch+1)
+    
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+    ax2 = ax1.twinx()
+    
+    line1, = ax1.plot(epochs_range, train_accs, color='#fda29d', label='Train Accuracy')
+    line2, = ax1.plot(epochs_range, val_accs, color='#ff63a1', label='Validation Accuracy')
+    line3, = ax2.plot(epochs_range, learning_rates, color='#fcc39b', label='Learning Rate') #type: ignore
+
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Metric Value')
+    ax2.set_ylabel('Learning Rate')
+    plt.title('Training Metrics by Epoch')
+
+    lines = [line3, line1, line2]
+    labels = [line.get_label() for line in lines]
+    ax1.legend(lines, labels, loc='upper left') #type: ignore
+
+    ax1.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.5)
+
+    fig.tight_layout()
+
+    plt.savefig(save_directory)
+
+    plt.close(fig)
+
+def update_params(model: nn.Module, train_dataloader: DataLoader, scaler: torch.amp.grad_scaler.GradScaler, optimizer: torch.optim.Optimizer, dev: str, epoch: int) -> Tuple[float, float]:
+    model.train()
+    epoch_loss = 0
+    correct = 0
+    total = 0
+    for image, y in tqdm.tqdm(train_dataloader, desc=f'Epoch {epoch}/Training'):
+        optimizer.zero_grad()
+        with te.fp8_autocast(enabled=True), torch.autocast(device_type=dev, dtype=torch.float16):
+            image = image.to(dev)
+            y = y.to(dev)
+            y_hat = model(image)
+            loss = F.cross_entropy(input=y_hat, target=y)
+            epoch_loss += loss.item()
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        total += image.shape[0]
+        preds = y_hat.argmax(dim=1)
+        correct += (preds == y).sum().item()
+        acc = (correct * 100) / total
+
+    return epoch_loss / len(train_dataloader), acc #type: ignore
+
+def validate(model: nn.Module, val_dataloader: DataLoader, dev: str, epoch: int) -> Tuple[float, float]:
+    model.eval()
+    val_loss = 0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for image, y in tqdm.tqdm(val_dataloader, desc=f'Epoch {epoch}/Validating'):
+            with torch.autocast(device_type=dev, dtype=torch.float16):
+                image = image.to(dev)
+                y = y.to(dev)
+                y_hat = model(image)
+                val_loss += F.cross_entropy(input=y_hat, target=y).item()
+                preds = y_hat.argmax(dim=1)
+                correct += (preds == y).sum().item()
+                total += image.shape[0]
+    val_loss /= len(val_dataloader)
+    acc = (correct * 100.) / total
+
+    return val_loss, acc
+
+def main() -> None:
+    with open('config.yaml') as stream:
+        config = yaml.safe_load(stream)
+    config_ds = config.get('dataset', {})
+    n_classes = config_ds.get('n_classes')
+    config_r50 = config.get('r50', {})
+
+    n_workers = config_r50.get('num_workers')
+    batch_size = config_r50.get('batch_size')
+    epochs = config_r50.get('epochs')
+    lr = config_r50.get('lr')
+    save_path = config_r50.get('save_path')
+    #lr_patience = config_r50.get('lr_patience')
+    #lr_thresh = config_r50.get('lr_thresh')
+    t_0 = config_r50.get('cosineannealing_t0')
+    t_mult = config_r50.get('cosineannealing_tmult')
+    save_path = config_r50.get('save_path')
+    plot_path = config_r50.get('plot_path')
+    log_path = config_r50.get('log_path')
+
+    log_file_path = create_file(log_path, 'log', 'txt') # Create log file at the beginning
+    print(f"Logging metrics to: {log_file_path}")
+    
+    print(plot_path)
+    plot_path = create_file(plot_path, 'plot', 'png')
+    print(plot_path)
+
+    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    train_transforms = v2.Compose([
+        v2.ToTensor(),
+        v2.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        v2.RandomRotation(degrees=180), #type: ignore
+        v2.RandomHorizontalFlip(p=0.5)
+    ])
+    val_transforms = v2.Compose([
+        v2.ToTensor(),
+        v2.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
+
+    train_dataset = ClassificationDataset(config=config_ds, subset='train', transforms=train_transforms)
+    train_dataloader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, num_workers=n_workers, pin_memory=True)
+    val_dataset = ClassificationDataset(config=config_ds, subset='val', transforms=val_transforms)
+    val_dataloader = DataLoader(dataset=val_dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
+
+    r50 = R50().to(dev)
+    #r50 = EfficientNetB0().to(dev)
+    linear_classifier = LinearClassifier(in_features=2048, n_classes=n_classes).to(dev)
+
+    optimizer = torch.optim.AdamW(
+        params=list(r50.parameters()) + list(linear_classifier.parameters()),
+        lr=lr    
+    )
+    scaler = torch.amp.grad_scaler.GradScaler(device=dev)
+    #scheduler = lr_scheduler.ReduceLROnPlateau(optimizer=optimizer, mode='max', patience=lr_patience, threshold=lr_thresh)
+    scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer=optimizer, T_0=t_0, T_mult=t_mult)
+
+    train_losses = []
+    train_accs = []
+    val_losses = []
+    val_accs = []
+    lrs = []
+
+    best_val_acc = 0
+
+    for epoch in tqdm.tqdm(range(1, epochs+1), desc='R50 IN1k128x128 Training'):
+        train_loss, train_acc = update_params(r50, linear_classifier, train_dataloader, scaler=scaler, optimizer=optimizer, dev=dev, epoch=epoch)
+        val_loss, val_acc = validate(r50, linear_classifier, val_dataloader, dev, epoch)
+
+        #scheduler.step(val_acc)
+        scheduler.step(epoch=epoch)
+        lrs.append(optimizer.param_groups[0]['lr'])
+        
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_accs.append(train_acc)
+        val_accs.append(val_acc)
+        with open(log_file_path, 'a') as log_file: # open log file in append mode
+            log_message = f"[{epoch}] Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, LR: {lrs[-1]:.3e}\n"
+            log_file.write(log_message)
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(r50.state_dict(), os.path.join(save_path, 'best/best_r50.pt'))
+            torch.save(linear_classifier.state_dict(), os.path.join(save_path, 'best/best_linearclassifier.pt'))
+
+        torch.save(r50.state_dict(), os.path.join(save_path, 'latest/latest_r50.pt'))
+        torch.save(linear_classifier.state_dict(), os.path.join(save_path, 'latest/latest_linearclassifier.pt'))
+
+        plot(train_accs, val_accs, lrs, epoch, plot_path)
+
+if __name__ == '__main__':
+    main()
